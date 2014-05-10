@@ -1,34 +1,84 @@
 var fs = require('fs');
 var path = require('path');
 var raf = require('random-access-file');
+var mkdirp = require('mkdirp');
+var rimraf = require('rimraf');
+var thunky = require('thunky');
 
 var noop = function() {};
 
 module.exports = function(folder, torrent) {
 	var that = {};
 
-	var bufferSize = torrent.pieceLength;
-	while (bufferSize < 256 * 1024 * 1024) bufferSize *= 2;
-
+	var destroyed = false;
+	var piecesMap = [];
 	var pieceLength = torrent.pieceLength;
-	var pieceRemainder = (torrent.length % pieceLength) || pieceLength;
-	var piecesPerBuffer = bufferSize / pieceLength;
-	var mem = [];
 	var files = [];
 
-	var pad = function(i) {
-		return '00000000000'.slice(0, 10-(''+i).length)+i;
-	};
+	torrent.files.forEach(function(file, idx) {
+		var fileStart = file.offset;
+		var fileEnd   = file.offset + file.length;
+
+		var firstPiece = Math.floor(fileStart / pieceLength);
+		var lastPiece  = Math.floor((fileEnd - 1) / pieceLength);
+
+		var open = thunky(function(cb) {
+			var filePath = path.join(folder, file.path);
+			var fileDir  = path.dirname(filePath);
+
+			mkdirp(fileDir, function(err) {
+				if (err) return cb(err);
+				if (destroyed) return cb(new Error('Storage destroyed'));
+
+				var f = raf(filePath);
+				files.push(f);
+				cb(null, f);
+			});
+		});
+
+		for (var p = firstPiece; p <= lastPiece; ++p) {
+			var pieceStart = p * pieceLength;
+			var pieceEnd   = pieceStart + pieceLength;
+
+			var from   = (fileStart < pieceStart) ? 0 : fileStart - pieceStart;
+			var to     = (fileEnd > pieceEnd) ? pieceLength : fileEnd - pieceStart;
+			var offset = (fileStart > pieceStart) ? 0 : pieceStart - fileStart;
+
+			if (!piecesMap[p]) piecesMap[p] = [];
+
+			piecesMap[p].push({
+				from:    from,
+				to:      to,
+				offset:  offset,
+				file:    idx,
+				open:    open
+			});
+		}
+	});
+
+	var mem = [];
 
 	that.read = function(index, cb) {
 		if (mem[index]) return cb(null, mem[index]);
 
-		var i = (index / piecesPerBuffer) | 0;
-		var offset = index - i * piecesPerBuffer;
-		var len = index === torrent.pieces.length-1 ? pieceRemainder : pieceLength;
-		var file = files[i] = files[i] || raf(path.join(folder, pad(i)));
+		var buffers = [];
+		var targets = piecesMap[index];
+		var i = 0;
+		var end = targets.length;
 
-		file.read(offset * pieceLength, len, cb);
+		var next = function(err, buffer) {
+			if (err) return cb(err);
+			if (buffer) buffers.push(buffer);
+			if (i >= end) return cb(null, Buffer.concat(buffers));
+
+			var target = targets[i++];
+			target.open(function(err, file) {
+				if (err) return cb(err);
+				file.read(target.offset, target.to - target.from, next);
+			});
+		};
+
+		next();
 	};
 
 	that.write = function(index, buffer, cb) {
@@ -36,20 +86,38 @@ module.exports = function(folder, torrent) {
 
 		mem[index] = buffer;
 
-		var ondone = function(err) {
-			mem[index] = null;
-			cb(err);
+		var targets = piecesMap[index];
+		var i = 0;
+		var end = targets.length;
+
+		var next = function(err) {
+			if (err) return cb(err);
+			if (i >= end) {
+				mem[index] = null;
+				return cb();
+			}
+
+			var target = targets[i++];
+			target.open(function(err, file) {
+				if (err) return cb(err);
+				file.write(target.offset, buffer.slice(target.from, target.to), next);
+			});
 		};
 
-		var i = (index / piecesPerBuffer) | 0;
-		var file = files[i] = files[i] || raf(path.join(folder, pad(i)));
-		var offset = index - i * piecesPerBuffer;
+		next();
+	};
 
-		file.write(offset * pieceLength, buffer, ondone);
+	that.remove = function(cb) {
+		if (!cb) cb = noop;
+		if (!torrent.files.length) return cb();
+
+		var root = torrent.files[0].path.split(path.sep)[0];
+		rimraf(path.join(folder, root), cb);
 	};
 
 	that.close = function(cb) {
 		if (!cb) cb = noop;
+		destroyed = true;
 
 		var i = 0;
 		var loop = function(err) {

@@ -6,7 +6,6 @@ var crypto = require('crypto');
 var bitfield = require('bitfield');
 var parseTorrent = require('parse-torrent');
 var mkdirp = require('mkdirp');
-var rimraf = require('rimraf');
 var events = require('events');
 var path = require('path');
 var fs = require('fs');
@@ -83,12 +82,20 @@ var torrentStream = function(link, opts) {
 
 	if (!opts) opts = {};
 	if (!opts.id) opts.id = '-TS0008-'+hat(48);
-	if (!opts.path) opts.path = path.join(opts.tmp || TMP, opts.name || 'torrent-stream', infoHash);
+	if (!opts.tmp) opts.tmp = TMP;
+	if (!opts.name) opts.name = 'torrent-stream';
 	if (!opts.blocklist) opts.blocklist = [];
+
+	var usingTmp = false;
+
+	if (!opts.path) {
+		usingTmp = true;
+		opts.path = path.join(opts.tmp, opts.name, infoHash);
+	}
 
 	var engine = new events.EventEmitter();
 	var swarm = pws(infoHash, opts.id, {size:opts.connections || opts.size});
-	var torrentPath = path.join(opts.path, 'cache.torrent');
+	var torrentPath = path.join(opts.tmp, opts.name, '.torrents', infoHash + '.torrent');
 
 	var wires = swarm.wires;
 	var critical = [];
@@ -339,8 +346,7 @@ var torrentStream = function(link, opts) {
 			var speed = wire.downloadSpeed() || 1;
 			if (speed > SPEED_THRESHOLD) return thruthy;
 
-			// we +1 here be on the safe side. rather buffer to much than to little
-			var secs = (1+MAX_REQUESTS) * piece.BLOCK_SIZE / speed;
+			var secs = MAX_REQUESTS * piece.BLOCK_SIZE / speed;
 			var tries = 10;
 			var ptr = 0;
 
@@ -352,7 +358,8 @@ var torrentStream = function(link, opts) {
 					var other = wires[ptr];
 					var otherSpeed = other.downloadSpeed();
 
-					if (otherSpeed < speed || !other.peerPieces[index]) continue;
+					if (otherSpeed < SPEED_THRESHOLD) continue;
+					if (otherSpeed <= speed || !other.peerPieces[index]) continue;
 					if ((missing -= otherSpeed * secs) > 0) continue;
 
 					tries--;
@@ -536,8 +543,15 @@ var torrentStream = function(link, opts) {
 					result['announce-list'] = [];
 
 					var buf = bncode.encode(result);
-					fs.writeFile(torrentPath, buf, function() {
-						ontorrent(parseTorrent(buf));
+					mkdirp(path.dirname(torrentPath), function(err) {
+						if (err) {
+							engine.emit('error', err);
+							return ontorrent(parseTorrent(buf));
+						}
+						fs.writeFile(torrentPath, buf, function(err) {
+							if (err) engine.emit('error', err);
+							ontorrent(parseTorrent(buf));
+						});
 					});
 					return;
 				}
@@ -559,16 +573,12 @@ var torrentStream = function(link, opts) {
 	});
 
 	swarm.pause();
-	mkdirp(opts.path, function(err) {
-		if (err) return engine.emit('error', err);
 
-		if (link.files) {
-			metadata = encode(link);
-			swarm.resume();
-			if (metadata) ontorrent(link);
-			return;
-		}
-
+	if (link.files) {
+		metadata = encode(link);
+		swarm.resume();
+		if (metadata) ontorrent(link);
+	} else {
 		fs.readFile(torrentPath, function(_, buf) {
 			swarm.resume();
 			if (!buf) return;
@@ -576,7 +586,7 @@ var torrentStream = function(link, opts) {
 			metadata = encode(torrent);
 			if (metadata) ontorrent(torrent);
 		});
-	});
+	}
 
 	engine.critical = function(piece, width) {
 		for (var i = 0; i < (width || 1); i++) critical[piece+i] = true;
@@ -619,8 +629,37 @@ var torrentStream = function(link, opts) {
 		swarm.remove(addr);
 	};
 
-	engine.remove = function(cb) {
-		rimraf(engine.path, cb || noop);
+	var removeTorrent = function(cb) {
+		fs.unlink(torrentPath, function(err) {
+			if (err) return cb(err);
+			fs.rmdir(path.dirname(torrentPath), function(err) {
+				if (err && err.code !== 'ENOTEMPTY') return cb(err);
+				cb();
+			});
+		});
+	};
+
+	var removeTmp = function(cb) {
+		removeTorrent(function(err) {
+			if (err || !usingTmp) return cb(err);
+			fs.rmdir(opts.path, function(err) {
+				if (err && err.code !== 'ENOTEMPTY') return cb(err);
+				cb();
+			});
+		});
+	};
+
+	engine.remove = function(keepPieces, cb) {
+		if (typeof keepPieces === "function") {
+			cb = keepPieces;
+			keepPieces = false;
+		}
+
+		if (keepPieces) return removeTmp(cb);
+		engine.store.remove(function(err) {
+			if (err) return cb(err);
+			removeTmp(cb);
+		});
 	};
 
 	engine.destroy = function(cb) {
