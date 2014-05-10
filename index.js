@@ -87,6 +87,7 @@ var torrentStream = function(link, opts) {
 	if (!opts.blocklist) opts.blocklist = [];
 
 	var usingTmp = false;
+	var destroyed = false;
 
 	if (!opts.path) {
 		usingTmp = true;
@@ -95,7 +96,7 @@ var torrentStream = function(link, opts) {
 
 	var engine = new events.EventEmitter();
 	var swarm = pws(infoHash, opts.id, {size:opts.connections || opts.size});
-	var torrentPath = path.join(opts.tmp, opts.name, '.torrents', infoHash + '.torrent');
+	var torrentPath = path.join(opts.tmp, opts.name, infoHash + '.torrent');
 
 	var wires = swarm.wires;
 	var critical = [];
@@ -580,6 +581,7 @@ var torrentStream = function(link, opts) {
 		if (metadata) ontorrent(link);
 	} else {
 		fs.readFile(torrentPath, function(_, buf) {
+			if (destroyed) return;
 			swarm.resume();
 			if (!buf) return;
 			var torrent = parseTorrent(buf);
@@ -640,12 +642,10 @@ var torrentStream = function(link, opts) {
 	};
 
 	var removeTmp = function(cb) {
-		removeTorrent(function(err) {
-			if (err || !usingTmp) return cb(err);
-			fs.rmdir(opts.path, function(err) {
-				if (err && err.code !== 'ENOTEMPTY') return cb(err);
-				cb();
-			});
+		if (!usingTmp) return removeTorrent(cb);
+		fs.rmdir(opts.path, function(err) {
+			if (err) return cb(err);
+			removeTorrent(cb);
 		});
 	};
 
@@ -655,7 +655,8 @@ var torrentStream = function(link, opts) {
 			keepPieces = false;
 		}
 
-		if (keepPieces) return removeTmp(cb);
+		if (keepPieces || !engine.store) return removeTmp(cb);
+
 		engine.store.remove(function(err) {
 			if (err) return cb(err);
 			removeTmp(cb);
@@ -663,6 +664,7 @@ var torrentStream = function(link, opts) {
 	};
 
 	engine.destroy = function(cb) {
+		destroyed = true;
 		swarm.destroy();
 		if (engine.tracker) engine.tracker.stop();
 		if (engine.dht) engine.dht.close();
